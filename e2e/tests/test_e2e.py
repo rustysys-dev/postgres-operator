@@ -15,6 +15,13 @@ def to_selector(labels):
     return ",".join(["=".join(l) for l in labels.items()])
 
 
+def clean_list(values):
+    strip = lambda v: v.strip()
+    notNone = lambda v: v
+
+    return filter(notNone, map(strip, values))
+
+
 class EndToEndTestCase(unittest.TestCase):
     '''
     Test interaction of the operator with multiple K8s components.
@@ -139,6 +146,50 @@ class EndToEndTestCase(unittest.TestCase):
                 })
 
             k8s.wait_for_running_pods(pod_selector, 2)
+
+            # Verify that all the databases have pooler schema installed.
+            # Do this via psql, since otherwise we need to deal with
+            # credentials.
+            dbList = []
+
+            leader = k8s.get_cluster_leader_pod('acid-minimal-cluster')
+            dbListQuery = "select datname from pg_database"
+            schemasQuery = """
+                select schema_name
+                from information_schema.schemata
+                where schema_name = pooler
+            """
+            exec_query = """psql -tAq -c "{query}" -d {db}"""
+
+            try:
+                q = exec_query.format(dbListQuery, "postgres")
+                print('Get databases: {}'.format(q))
+                result = k8s.exec_with_kubectl(leader.metadata.name, q)
+                dbList = clean_list(result.stdout.split(b'\n'))
+                print('dbList: {}, stdout: {}, stderr {}'.format(
+                    dbList, result.stdout, result.stderr
+                ))
+            except Exception as ex:
+                print('Could not get databases: {}'.format(ex))
+                print('Stdout: {}'.format(result.stdout))
+                print('Stderr: {}'.format(result.stderr))
+
+            for db in dbList:
+                schemas = []
+                try:
+                    q = exec_query.format(schemasQuery, db)
+                    print('Get schemas: {}'.format(q))
+                    result = k8s.exec_with_kubectl(leader.metadata.name, q)
+                    schemas = clean_list(result.stdout.split(b'\n'))
+                    print('schemas: {}, stdout: {}, stderr {}'.format(
+                        schemas, result.stdout, result.stderr
+                    ))
+                except Exception as ex:
+                    print('Could not get databases: {}'.format(ex))
+                    print('Stdout: {}'.format(result.stdout))
+                    print('Stderr: {}'.format(result.stderr))
+
+                self.assertNotEqual(len(schemas), 0)
 
             # turn it off, keeping configuration section
             k8s.api.custom_objects_api.patch_namespaced_custom_object(
@@ -861,6 +912,19 @@ class K8s:
                 replica_pod_nodes.append(pod.spec.node_name)
 
         return master_pod_node, replica_pod_nodes
+
+    def get_cluster_leader_pod(self, pg_cluster_name, namespace='default'):
+        labels = {
+            'application': 'spilo',
+            'cluster-name': pg_cluster_name,
+            'spilo-role': 'master',
+        }
+
+        pods = self.api.core_v1.list_namespaced_pod(
+                namespace, label_selector=to_selector(labels))
+
+        if pods:
+            return pods[0]
 
     def wait_for_operator_pod_start(self):
         self. wait_for_pod_start("name=postgres-operator")
